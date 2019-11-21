@@ -207,6 +207,10 @@ bool getIP(URLInfo *urlInfo)
             cacheIP(urlInfo);
             resolvedIP = true;
         }
+        else
+        {
+            printf("Couldn't get IP for %s\n", urlInfo->website);
+        }
     }
     return resolvedIP;
 }
@@ -214,7 +218,31 @@ bool getIP(URLInfo *urlInfo)
 /* Checks if website or ip address is in the blacklist file */
 bool isBlacklisted(char *website, char *ip)
 {
-    return true;
+    FILE* blackListFile = fopen(BLACKLISTFILE, "r");
+    char * line = NULL;
+    ssize_t len = 0;
+    ssize_t read;
+
+    while ((read = getline(&line, &len, blackListFile)) != -1) 
+    {
+        if (strstr(line, website) != NULL)
+        {
+            printf("'%s' is blacklisted\n", website);
+            return true;
+        }
+        else if(strstr(line, ip) != NULL)
+        {
+            printf("'%s' is blacklisted\n", ip);
+            return true;
+        }
+    }
+    
+    fclose(blackListFile);
+    if (line)
+        free(line);
+    
+    return false;
+    
 }
 
 /*
@@ -260,14 +288,12 @@ void handleRequest(int connfd)
     
     if (! getIP(&request.urlInfo) )
     {
-        printf("Unable to get IP address for %s\n", request.urlInfo.website);
         // SEND 400 Bad Request
         return;
     }
 
     if (isBlacklisted(request.urlInfo.website, request.urlInfo.IP))
     {
-        printf("%s | %s is blacklisted\n", request.urlInfo.website, request.urlInfo.IP);
         // SEND ERROR 403 Forbidden
         return;
     }
