@@ -187,7 +187,14 @@ bool getIPFromDNSLookup(URLInfo* urlInfo)
 
 void cacheIP(URLInfo *urlInfo)
 {
-    
+    FILE* ips = fopen(RESOLVEDIPSFILE, "a");
+    if (!ips)
+    {
+        printf("Unable to open %s\n", RESOLVEDIPSFILE);
+        return;
+    }
+    fprintf(ips, "%s    %s\n", urlInfo->website, urlInfo->IP);
+    fclose(ips);
 }
 
 bool getIP(URLInfo *urlInfo) 
