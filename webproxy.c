@@ -23,8 +23,10 @@
 #define MAXLINE 8192 /* max buffer length */
 #define LISTENQ  1024  /* second argument to listen() */
 
-#define RESOLVEDIPSFILE "cache/resolvedIPs.txt"
 #define BLACKLISTFILE "blacklist.txt"
+
+#define CACHEDIR "cache/"
+#define RESOLVEDIPSFILE "cache/resolvedIPs.txt"
 
 typedef enum
 { 
@@ -57,7 +59,7 @@ void handleRequest(int connfd);
 void *thread(void *vargp);
 
 void handleRequest(int clientSock);
-bool respondByCache(int clientSock, Request* request);
+bool respondByCache(int clientSock, char *clientBuffer, Request* request);
 bool respondByServer(int clientSock, char *serverBuffer, Request* request);
 
 int main(int argc, char **argv)
@@ -342,24 +344,58 @@ void handleRequest(int clientSock)
         sendError(BLACKLISTED, clientBuffer, request.httpVersion, clientSock);
         return;
     }
-    
-    bool respondSuccess = respondByCache(clientSock, &request) || respondByServer(clientSock, serverBuffer, &request);
+
+    bzero(clientBuffer, MAXLINE);
+    bool respondSuccess = respondByCache(clientSock, clientBuffer, &request) || respondByServer(clientSock, serverBuffer, &request);
     if (!respondSuccess)
     {
-        printf("shit\n");
+        bzero(clientBuffer, MAXLINE);
+        sendError(PAGENOTFOUND, clientBuffer, request.httpVersion, clientSock);
+        return;
     }
 }
 
-bool respondByCache(int clientSock, Request* request)
-{
-    return false;
+long int getFileSize(FILE* file) {
+    fseek(file, 0L, SEEK_END);
+    long int fileSize = ftell(file);
+    fseek(file, 0L, SEEK_SET);
+    return fileSize;
 }
 
-bool connectToServer(int *server_sock, struct sockaddr_in *server, socklen_t *serverLen, char *IP)
+bool respondByCache(int clientSock, char *clientBuffer, Request* request)
 {
-    *server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    char cacheFileName[strlen(CACHEDIR)+HASHSTRLEN];
+    strcpy(cacheFileName, CACHEDIR);
+    strcat(cacheFileName, request->urlInfo.md5Hash);
+    FILE* cacheFile = fopen(cacheFileName, "r");
 
-    if (*server_sock == -1)
+    if (!cacheFile)
+    {
+        return false;
+    }
+    
+    int bytesToBeRead = getFileSize(cacheFile);
+    int readBufferSize = fmin(MAXLINE, bytesToBeRead);
+    int bytesRead;
+
+    while ( (bytesRead = fread(clientBuffer, 1, MAXLINE, cacheFile)) > 0 )
+    {
+        write(clientSock, clientBuffer, bytesRead);
+        bytesToBeRead -= bytesRead;
+
+        readBufferSize = fmin(MAXLINE, bytesToBeRead);
+        
+        bzero(clientBuffer, MAXLINE);
+    }
+    
+    return true;
+}
+
+bool connectToServer(int *serverSock, struct sockaddr_in *server, socklen_t *serverLen, char *IP)
+{
+    *serverSock = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (*serverSock == -1)
     {
         printf("Failed to create server socket");
         return false;
@@ -370,7 +406,7 @@ bool connectToServer(int *server_sock, struct sockaddr_in *server, socklen_t *se
     server->sin_port = htons(80);
     
     *serverLen = sizeof(*server);
-    int conn = connect(*server_sock, (struct sockaddr *) server, *serverLen);
+    int conn = connect(*serverSock, (struct sockaddr *) server, *serverLen);
     if (conn == -1)
     {
         printf("error in socket conection\n");
@@ -382,28 +418,39 @@ bool connectToServer(int *server_sock, struct sockaddr_in *server, socklen_t *se
 
 bool respondByServer(int clientSock, char *serverBuffer, Request* request)
 {
-    int server_sock;
+    int serverSock;
     struct sockaddr_in server;
     socklen_t serverLen;
-    if (!connectToServer(&server_sock, &server, &serverLen, request->urlInfo.IP))
+    if (!connectToServer(&serverSock, &server, &serverLen, request->urlInfo.IP))
     {
         return false;
     }
     
-    printf("trying to get %s\n", request->urlInfo.page);
+    //printf("trying to get %s\n", request->urlInfo.page);
     ssize_t sent_bytes;
     ssize_t received_bytes;
     
-    sent_bytes = send(server_sock, serverBuffer, strlen(serverBuffer), 0);
-    
+    sent_bytes = send(serverSock, serverBuffer, strlen(serverBuffer), 0);
     bzero(serverBuffer, MAXLINE);
-    while ((received_bytes = recvfrom(server_sock, serverBuffer, MAXLINE, 0, (struct sockaddr *) &server, &serverLen)) > 0) 
+
+    char cacheFileName[strlen(CACHEDIR)+HASHSTRLEN];
+    strcpy(cacheFileName, CACHEDIR);
+    strcat(cacheFileName, request->urlInfo.md5Hash);
+    FILE* cacheFile = fopen(cacheFileName, "a");
+    
+    while ((received_bytes = recvfrom(serverSock, serverBuffer, MAXLINE, 0, (struct sockaddr *) &server, &serverLen)) > 0) 
     {
         sent_bytes = send(clientSock, serverBuffer, received_bytes, 0);
         
+        fwrite(serverBuffer, 1, received_bytes, cacheFile);
+
         bzero(serverBuffer, MAXLINE);
     }
-    printf("got %s\n", request->urlInfo.page);
+
+    //printf("got %s\n", request->urlInfo.page);
+
+    fclose(cacheFile);
+    close(serverSock);
     return true;
 }
 

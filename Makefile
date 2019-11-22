@@ -4,3 +4,4 @@ all: webproxy.c
 
 clean: 
 	$(RM) webproxy
+	$(RM) cache/*
