@@ -26,18 +26,26 @@
 #define RESOLVEDIPSFILE "cache/resolvedIPs.txt"
 #define BLACKLISTFILE "blacklist.txt"
 
-typedef struct {
+typedef enum
+{ 
+    SUCCESS, 
+    BADREQUEST, 
+    IPNOTFOUND, 
+    BLACKLISTED 
+} PROXYSTATUS;
+
+typedef struct 
+{
     char md5Hash[HASHSTRLEN];
     char website[100];
     char IP[45];
     int port;
-    char page[100];
+    char page[200];
 } URLInfo;
 
 typedef struct 
 {
-    char method[5];
-    //char URL[1000];
+    char method[10];
     URLInfo urlInfo;
     char httpVersion[15];
     //bool keepConnAlive;
@@ -47,18 +55,10 @@ int open_listenfd(int port);
 void handleRequest(int connfd);
 void *thread(void *vargp);
 
-void parseFirstLine(Request* req, char *fline);
-void parseRequest(Request* req, char *reqStr);
-
-bool getIPFromCacheLookup(URLInfo *urlInfo);
-
-bool isBlacklisted(char *website, char *ip);
-
-void compute_md5(char *str, char hashStr[HASHSTRLEN]);
-
 int main(int argc, char **argv)
 {
-    int listenfd, *connfdp, port, clientlen=sizeof(struct sockaddr_in);
+    int listenfd, *connfdp, port;
+    socklen_t clientlen = sizeof(struct sockaddr_in);
     struct sockaddr_in clientaddr;
     pthread_t tid; 
 
@@ -79,10 +79,30 @@ int main(int argc, char **argv)
     }
 }
 
+/*
+ * Computes the md5sum hash of 'str'
+ * and fills hashStr with the hash's string representation
+ * Source: https://stackoverflow.com/a/7627763
+ */
+void compute_md5(char *str, char hashStr[HASHSTRLEN]) 
+{
+    unsigned char digest[CC_MD5_DIGEST_LENGTH];
+
+    CC_MD5_CTX context;
+    CC_MD5_Init(&context);
+    CC_MD5_Update(&context, str, (CC_LONG)strlen(str));
+    CC_MD5_Final(digest, &context);
+
+    for(int i = 0; i < CC_MD5_DIGEST_LENGTH; ++i)
+    {
+        sprintf(&hashStr[i*2], "%02x", (unsigned int)digest[i]);
+    }
+}
+
 void parseURL(URLInfo* urlInfo, char *urlStr)
 {
     urlInfo->port = 80;
-    //compute_md5(urlStr, urlInfo->md5Hash);
+    compute_md5(urlStr, urlInfo->md5Hash);
     sscanf(urlStr, "http://%99[^/]/%99[^\n]", urlInfo->website, urlInfo->page);
 }
 
@@ -90,7 +110,7 @@ void parseURL(URLInfo* urlInfo, char *urlStr)
  * Parsing HTTP request's first line
  * "<RequestMethod> <RequestURL> <HTTPVersion*>"
  */
-void parseFirstLine(Request* req, char *fline) 
+bool parseFirstLine(Request* req, char *fline) 
 {
     int i = 0;
     char *tok = strtok(fline, " \n");
@@ -102,31 +122,48 @@ void parseFirstLine(Request* req, char *fline)
         tok = strtok (NULL, " \r\n");
     }
 
-    strcpy(req->method, tokens[0]);
-
-    parseURL(&req->urlInfo, tokens[1]);
+    if (i < 3)
+    {
+        printf("Invalid First Line\n");
+        return false;   
+    } 
 
     strcpy(req->httpVersion, tokens[2]);
+    
+    strcpy(req->method, tokens[0]);
+    if (strcmp(req->method, "GET") != 0)
+    {
+        printf("Unsupported method %s\n", req->method);
+        return false;
+    }
+
+    parseURL(&req->urlInfo, tokens[1]);
+    return true;
 }
 
 /*
  * Splits the HTTP request string by newline
  * and fills Request struct with the parsed info
  */
-void parseRequest(Request* req, char *reqStr) 
+bool parseRequest(Request* req, char *reqStr) 
 {
     int i = 0;
-    char *tok = strtok(reqStr, "\n");
-    char *lines[3];
+    int linesToParse = 1;   // increase if need to parse more details
 
-    while (tok != NULL && i < 3) 
+    char *tok = strtok(reqStr, "\n");
+    char *lines[linesToParse];
+
+    while (tok != NULL && i < linesToParse) 
     {
         lines[i++] = tok;
         tok = strtok (NULL, "\n");
     }
+
+    if (i < linesToParse)
+        return false;
     
-    parseFirstLine(req, lines[0]);
-    //req->keepConnAlive = strcmp(lines[2],"Connection: keep-alive\r") == 0;
+    bool firstLineParseSuccess = parseFirstLine(req, lines[0]);
+    return firstLineParseSuccess;
 }
 
 bool getIPFromCacheLookup(URLInfo *urlInfo)
@@ -135,7 +172,7 @@ bool getIPFromCacheLookup(URLInfo *urlInfo)
 
     FILE* ips;
     char * line = NULL;
-    ssize_t len = 0;
+    size_t len = 0;
     ssize_t read;
     
     ips = fopen(RESOLVEDIPSFILE, "r");
@@ -154,7 +191,7 @@ bool getIPFromCacheLookup(URLInfo *urlInfo)
         if (strcmp(website, urlInfo->website) == 0)
         {
             strcpy(urlInfo->IP, IP);
-            printf("IP %s for %s found via cache lookup\n", urlInfo->IP, urlInfo->website);
+            //printf("IP %s for %s found via cache lookup\n", urlInfo->IP, urlInfo->website);
             foundIP = true;
             break;
         }
@@ -175,12 +212,12 @@ bool getIPFromDNSLookup(URLInfo* urlInfo)
     host_entry = gethostbyname(urlInfo->website);
     if (!host_entry)
     {
-        printf("couldn't resolve %s via DNS\n", urlInfo->website);
+        //printf("couldn't resolve %s via DNS\n", urlInfo->website);
         return false;
     }
 
     strcpy(urlInfo->IP, inet_ntoa(*((struct in_addr*) host_entry->h_addr_list[0])));
-    printf("IP %s for %s found via DNS lookup\n", urlInfo->IP, urlInfo->website);
+    //printf("IP %s for %s found via DNS lookup\n", urlInfo->IP, urlInfo->website);
 
     return true;
 }
@@ -220,7 +257,7 @@ bool isBlacklisted(char *website, char *ip)
 {
     FILE* blackListFile = fopen(BLACKLISTFILE, "r");
     char * line = NULL;
-    ssize_t len = 0;
+    size_t len = 0;
     ssize_t read;
 
     while ((read = getline(&line, &len, blackListFile)) != -1) 
@@ -245,68 +282,128 @@ bool isBlacklisted(char *website, char *ip)
     
 }
 
-/*
- * Computes the md5sum hash of 'str'
- * and fills hashStr with the hash's string representation
- * Source: https://stackoverflow.com/a/7627763
- */
-void compute_md5(char *str, char hashStr[HASHSTRLEN]) 
+void sendError(PROXYSTATUS errReason, char *clientBuffer, char *httpVersion, int clientSock)
 {
-    unsigned char digest[CC_MD5_DIGEST_LENGTH];
-
-    CC_MD5_CTX context;
-    CC_MD5_Init(&context);
-    CC_MD5_Update(&context, str, (CC_LONG)strlen(str));
-    CC_MD5_Final(digest, &context);
-
-    for(int i = 0; i < CC_MD5_DIGEST_LENGTH; ++i)
+    if (errReason == BADREQUEST)
     {
-        sprintf(&hashStr[i*2], "%02x", (unsigned int)digest[i]);
+        snprintf(clientBuffer, MAXLINE, "<html><body><h1>%s 400 Bad Request</h1></body></html>", httpVersion);
     }
+    else if (errReason == IPNOTFOUND)
+    {
+        snprintf(clientBuffer, MAXLINE, "<html><body><h1>%s 404 Not Found</h1></body></html>", httpVersion);
+    }
+    else if (errReason == BLACKLISTED)
+    {
+        snprintf(clientBuffer, MAXLINE, "<html><body><h1>%s 403 Forbidden</h1></body></html>", httpVersion);
+    }
+
+    send(clientSock, clientBuffer, strlen(clientBuffer), 0);
+}
+
+int getServerSock(char *IP)
+{
+    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in server;
+
+    if (server_sock == -1)
+    {
+        printf("Failed to create server socket");
+    }
+
+    server.sin_family = AF_INET;
+    inet_aton(IP, &server.sin_addr);
+    server.sin_port = htons(80);
+    
+    int conn = connect(server_sock, (struct sockaddr *) &server, sizeof(server));
+    if (conn == -1)
+    {
+        printf("error in socket conection\n");
+        return -1;
+    }
+    
+    return server_sock;
 }
 
 /*
  * Handles client requests
  */
-void handleRequest(int connfd) 
+void handleRequest(int clientSock) 
 {
+    char clientBuffer[MAXLINE];
+    char serverBuffer[MAXLINE];
     size_t n; 
-    char buf[MAXLINE]; 
 
-    n = read(connfd, buf, MAXLINE);
-    printf("%s\n", buf);
+    n = read(clientSock, clientBuffer, MAXLINE);
+    strcpy(serverBuffer, clientBuffer);
+
+    //printf("%s\n", serverBuffer);
 
     Request request;
-    parseRequest(&request, buf);
-    
-    if (strcmp(request.method, "GET") != 0) 
+
+    if (! parseRequest(&request, clientBuffer))
     {
-        printf("ONLY GET METHOD IS SUPPORTED BY PROXY!\n");
-        // SEND HTTP 400 Bad Request error message
+        sendError(BADREQUEST, clientBuffer, request.httpVersion, clientSock);
         return;
     }
     
     if (! getIP(&request.urlInfo) )
     {
-        // SEND 400 Bad Request
+        sendError(IPNOTFOUND, clientBuffer, request.httpVersion, clientSock);
         return;
     }
 
     if (isBlacklisted(request.urlInfo.website, request.urlInfo.IP))
     {
-        // SEND ERROR 403 Forbidden
+        sendError(BLACKLISTED, clientBuffer, request.httpVersion, clientSock);
         return;
     }
+
+
+    
+    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in server;
+    socklen_t serverLen;
+
+    if (server_sock == -1)
+    {
+        printf("Failed to create server socket");
+    }
+
+    server.sin_family = AF_INET;
+    inet_aton(request.urlInfo.IP, &server.sin_addr);
+    server.sin_port = htons(80);
+    
+    serverLen = sizeof(server);
+    int conn = connect(server_sock, (struct sockaddr *) &server, serverLen);
+    if (conn == -1)
+    {
+        printf("error in socket conection\n");
+        return;
+    }
+
+    //printf("trying to get %s\n", request.urlInfo.page);
+    ssize_t sent_bytes;
+    ssize_t received_bytes;
+    
+    sent_bytes = send(server_sock, serverBuffer, strlen(serverBuffer), 0);
+    
+    bzero(clientBuffer, MAXLINE);
+    while ((received_bytes = recvfrom(server_sock, clientBuffer, MAXLINE, 0, (struct sockaddr *) &server, &serverLen)) > 0) 
+    {
+        sent_bytes = send(clientSock, clientBuffer, received_bytes, 0);
+        bzero(clientBuffer, MAXLINE);
+    }
+    //printf("got %s\n", request.urlInfo.page);
 }
 
 /* thread routine */
 void * thread(void * vargp) 
 {  
-    int connfd = *((int *)vargp);
+    int clientSock = *((int *)vargp);
     pthread_detach(pthread_self()); 
     free(vargp);
-    handleRequest(connfd);
-    close(connfd);
+    handleRequest(clientSock);
+    close(clientSock);
     return NULL;
 }
 
