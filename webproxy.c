@@ -31,7 +31,8 @@ typedef enum
     SUCCESS, 
     BADREQUEST, 
     IPNOTFOUND, 
-    BLACKLISTED 
+    BLACKLISTED,
+    PAGENOTFOUND
 } PROXYSTATUS;
 
 typedef struct 
@@ -54,6 +55,10 @@ typedef struct
 int open_listenfd(int port);
 void handleRequest(int connfd);
 void *thread(void *vargp);
+
+void handleRequest(int clientSock);
+bool respondByCache(int clientSock, Request* request);
+bool respondByServer(int clientSock, char *serverBuffer, Request* request);
 
 int main(int argc, char **argv)
 {
@@ -296,32 +301,12 @@ void sendError(PROXYSTATUS errReason, char *clientBuffer, char *httpVersion, int
     {
         snprintf(clientBuffer, MAXLINE, "<html><body><h1>%s 403 Forbidden</h1></body></html>", httpVersion);
     }
+    else if (errReason == BLACKLISTED)
+    {
+        snprintf(clientBuffer, MAXLINE, "<html><body><h1>%s 404 Not Found</h1></body></html>", httpVersion);
+    }
 
     send(clientSock, clientBuffer, strlen(clientBuffer), 0);
-}
-
-int getServerSock(char *IP)
-{
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in server;
-
-    if (server_sock == -1)
-    {
-        printf("Failed to create server socket");
-    }
-
-    server.sin_family = AF_INET;
-    inet_aton(IP, &server.sin_addr);
-    server.sin_port = htons(80);
-    
-    int conn = connect(server_sock, (struct sockaddr *) &server, sizeof(server));
-    if (conn == -1)
-    {
-        printf("error in socket conection\n");
-        return -1;
-    }
-    
-    return server_sock;
 }
 
 /*
@@ -357,43 +342,69 @@ void handleRequest(int clientSock)
         sendError(BLACKLISTED, clientBuffer, request.httpVersion, clientSock);
         return;
     }
-
-
     
-    int server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in server;
-    socklen_t serverLen;
+    bool respondSuccess = respondByCache(clientSock, &request) || respondByServer(clientSock, serverBuffer, &request);
+    if (!respondSuccess)
+    {
+        printf("shit\n");
+    }
+}
 
-    if (server_sock == -1)
+bool respondByCache(int clientSock, Request* request)
+{
+    return false;
+}
+
+bool connectToServer(int *server_sock, struct sockaddr_in *server, socklen_t *serverLen, char *IP)
+{
+    *server_sock = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (*server_sock == -1)
     {
         printf("Failed to create server socket");
+        return false;
     }
 
-    server.sin_family = AF_INET;
-    inet_aton(request.urlInfo.IP, &server.sin_addr);
-    server.sin_port = htons(80);
+    server->sin_family = AF_INET;
+    inet_aton(IP, &server->sin_addr);
+    server->sin_port = htons(80);
     
-    serverLen = sizeof(server);
-    int conn = connect(server_sock, (struct sockaddr *) &server, serverLen);
+    *serverLen = sizeof(*server);
+    int conn = connect(*server_sock, (struct sockaddr *) server, *serverLen);
     if (conn == -1)
     {
         printf("error in socket conection\n");
-        return;
+        return false;
     }
+    
+    return true;
+}
 
-    //printf("trying to get %s\n", request.urlInfo.page);
+bool respondByServer(int clientSock, char *serverBuffer, Request* request)
+{
+    int server_sock;
+    struct sockaddr_in server;
+    socklen_t serverLen;
+    if (!connectToServer(&server_sock, &server, &serverLen, request->urlInfo.IP))
+    {
+        return false;
+    }
+    
+    printf("trying to get %s\n", request->urlInfo.page);
     ssize_t sent_bytes;
     ssize_t received_bytes;
     
     sent_bytes = send(server_sock, serverBuffer, strlen(serverBuffer), 0);
     
-    bzero(clientBuffer, MAXLINE);
-    while ((received_bytes = recvfrom(server_sock, clientBuffer, MAXLINE, 0, (struct sockaddr *) &server, &serverLen)) > 0) 
+    bzero(serverBuffer, MAXLINE);
+    while ((received_bytes = recvfrom(server_sock, serverBuffer, MAXLINE, 0, (struct sockaddr *) &server, &serverLen)) > 0) 
     {
-        sent_bytes = send(clientSock, clientBuffer, received_bytes, 0);
-        bzero(clientBuffer, MAXLINE);
+        sent_bytes = send(clientSock, serverBuffer, received_bytes, 0);
+        
+        bzero(serverBuffer, MAXLINE);
     }
-    //printf("got %s\n", request.urlInfo.page);
+    printf("got %s\n", request->urlInfo.page);
+    return true;
 }
 
 /* thread routine */
