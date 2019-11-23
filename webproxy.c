@@ -1,15 +1,16 @@
+#include <arpa/inet.h>
+#include <math.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>      /* for fgets */
 #include <strings.h>     /* for bzero, bcopy */
-#include <unistd.h>      /* for read, write */
 #include <sys/socket.h>  /* for socket use */
-#include <netdb.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
-#include <stdbool.h>
-#include <math.h>
+#include <time.h>
+#include <unistd.h>      /* for read, write */
 
 #if defined(__APPLE__)
 #  define COMMON_DIGEST_FOR_OPENSSL
@@ -25,8 +26,9 @@
 
 #define BLACKLISTFILE "blacklist.txt"
 
+int cacheTimeoutInSeconds = 3600;
 #define CACHEDIR "cache/"
-#define RESOLVEDIPSFILE "cache/resolvedIPs.txt"
+#define RESOLVEDIPSFILE "resolvedIPs.txt"
 
 typedef enum
 { 
@@ -55,27 +57,27 @@ typedef struct
 } Request;
 
 int open_listenfd(int port);
-void handleRequest(int connfd);
 void *thread(void *vargp);
 
-void handleRequest(int clientSock);
+void handleRequest(int connfd);
 bool respondByCache(int clientSock, char *clientBuffer, Request* request);
 bool respondByServer(int clientSock, char *serverBuffer, Request* request);
 
 int main(int argc, char **argv)
 {
-    int listenfd, *connfdp, port;
+    int listenfd, *connfdp, port, timeout;
     socklen_t clientlen = sizeof(struct sockaddr_in);
     struct sockaddr_in clientaddr;
     pthread_t tid; 
 
-    if (argc != 2) 
+    if (argc < 3) 
     {
-        fprintf(stderr, "usage: %s <port>\n", argv[0]);
+        fprintf(stderr, "usage: %s <port> <cacheTimeout(seconds)>\n", argv[0]);
         exit(0);
     }
     
     port = atoi(argv[1]);
+    cacheTimeoutInSeconds = atoi(argv[2]);
 
     listenfd = open_listenfd(port);
     while (1) 
@@ -140,7 +142,7 @@ bool parseFirstLine(Request* req, char *fline)
     strcpy(req->method, tokens[0]);
     if (strcmp(req->method, "GET") != 0)
     {
-        printf("Unsupported method %s\n", req->method);
+        //printf("Unsupported method %s\n", req->method);
         return false;
     }
 
@@ -169,8 +171,7 @@ bool parseRequest(Request* req, char *reqStr)
     if (i < linesToParse)
         return false;
     
-    bool firstLineParseSuccess = parseFirstLine(req, lines[0]);
-    return firstLineParseSuccess;
+    return parseFirstLine(req, lines[0]);;
 }
 
 bool getIPFromCacheLookup(URLInfo *urlInfo)
@@ -219,13 +220,12 @@ bool getIPFromDNSLookup(URLInfo* urlInfo)
     host_entry = gethostbyname(urlInfo->website);
     if (!host_entry)
     {
-        //printf("couldn't resolve %s via DNS\n", urlInfo->website);
+        printf("couldn't resolve %s via DNS\n", urlInfo->website);
         return false;
     }
 
     strcpy(urlInfo->IP, inet_ntoa(*((struct in_addr*) host_entry->h_addr_list[0])));
     //printf("IP %s for %s found via DNS lookup\n", urlInfo->IP, urlInfo->website);
-
     return true;
 }
 
@@ -286,7 +286,6 @@ bool isBlacklisted(char *website, char *ip)
         free(line);
     
     return false;
-    
 }
 
 void sendError(PROXYSTATUS errReason, char *clientBuffer, char *httpVersion, int clientSock)
@@ -303,11 +302,10 @@ void sendError(PROXYSTATUS errReason, char *clientBuffer, char *httpVersion, int
     {
         snprintf(clientBuffer, MAXLINE, "<html><body><h1>%s 403 Forbidden</h1></body></html>", httpVersion);
     }
-    else if (errReason == BLACKLISTED)
+    else if (errReason == PAGENOTFOUND)
     {
         snprintf(clientBuffer, MAXLINE, "<html><body><h1>%s 404 Not Found</h1></body></html>", httpVersion);
     }
-
     send(clientSock, clientBuffer, strlen(clientBuffer), 0);
 }
 
@@ -324,7 +322,6 @@ void handleRequest(int clientSock)
     strcpy(serverBuffer, clientBuffer);
 
     //printf("%s\n", serverBuffer);
-
     Request request;
 
     if (! parseRequest(&request, clientBuffer))
@@ -346,16 +343,54 @@ void handleRequest(int clientSock)
     }
 
     bzero(clientBuffer, MAXLINE);
+
+    //printf("trying to get %s\n", request.urlInfo.page);
     bool respondSuccess = respondByCache(clientSock, clientBuffer, &request) || respondByServer(clientSock, serverBuffer, &request);
     if (!respondSuccess)
     {
         bzero(clientBuffer, MAXLINE);
         sendError(PAGENOTFOUND, clientBuffer, request.httpVersion, clientSock);
-        return;
     }
+    //printf("Resolved %s\n", request.urlInfo.page);
 }
 
-long int getFileSize(FILE* file) {
+bool isCacheFileValid(FILE *cacheFile, char *cacheFileName, int *bytesRead)
+{
+    if (!cacheFile)
+    {   
+        //printf("%s not in cache\n", cacheFileName);
+        return false;
+    }
+    char firstLine[30];    
+    if (feof(cacheFile) || (!fgets(firstLine, sizeof(firstLine), cacheFile)))
+    {
+        //printf("couldn't read first line of cache file\n");
+        fclose(cacheFile);
+        return false;
+    }
+    *bytesRead = (int)ftell(cacheFile);
+    
+    int cacheTimeStamp;
+    if (sscanf(firstLine, "%d\n", &cacheTimeStamp) <= 0)
+    {
+        printf("couldn't parse first line of cache file\n");
+        fclose(cacheFile);
+        return false;
+    }
+    
+    int now = (unsigned)time(NULL);
+    int cacheFileAge = now - cacheTimeStamp;
+    if (cacheFileAge >= cacheTimeoutInSeconds)
+    {
+        printf("Cache file %s is stale (Age: %d, Timeout %d)\n", cacheFileName, cacheFileAge, cacheTimeoutInSeconds);
+        fclose(cacheFile);
+        return false;
+    }
+    return true;
+}
+
+long int getFileSize(FILE* file) 
+{
     fseek(file, 0L, SEEK_END);
     long int fileSize = ftell(file);
     fseek(file, 0L, SEEK_SET);
@@ -364,37 +399,42 @@ long int getFileSize(FILE* file) {
 
 bool respondByCache(int clientSock, char *clientBuffer, Request* request)
 {
+    FILE* cacheFile;
+    int bytesRead;
+
     char cacheFileName[strlen(CACHEDIR)+HASHSTRLEN];
     strcpy(cacheFileName, CACHEDIR);
     strcat(cacheFileName, request->urlInfo.md5Hash);
-    FILE* cacheFile = fopen(cacheFileName, "r");
 
-    if (!cacheFile)
+    cacheFile = fopen(cacheFileName, "rb");
+    if(!isCacheFileValid(cacheFile, cacheFileName, &bytesRead))
     {
         return false;
     }
     
-    int bytesToBeRead = getFileSize(cacheFile);
-    int readBufferSize = fmin(MAXLINE, bytesToBeRead);
-    int bytesRead;
+    int bytesToBeRead = getFileSize(cacheFile) - bytesRead;
+    fseek(cacheFile, bytesRead, SEEK_SET);
 
-    while ( (bytesRead = fread(clientBuffer, 1, MAXLINE, cacheFile)) > 0 )
+    int readBufferSize = fmin(MAXLINE, bytesToBeRead);
+
+    while ( (bytesRead = fread(clientBuffer, 1, readBufferSize, cacheFile)) > 0 )
     {
         write(clientSock, clientBuffer, bytesRead);
         bytesToBeRead -= bytesRead;
 
         readBufferSize = fmin(MAXLINE, bytesToBeRead);
-        
         bzero(clientBuffer, MAXLINE);
     }
-    
+
+    fclose(cacheFile);
+
+    printf("got %s by cache\n", request->urlInfo.md5Hash);
     return true;
 }
 
 bool connectToServer(int *serverSock, struct sockaddr_in *server, socklen_t *serverLen, char *IP)
 {
     *serverSock = socket(AF_INET, SOCK_STREAM, 0);
-
     if (*serverSock == -1)
     {
         printf("Failed to create server socket");
@@ -416,6 +456,11 @@ bool connectToServer(int *serverSock, struct sockaddr_in *server, socklen_t *ser
     return true;
 }
 
+void writeTimeStamp(FILE *file)
+{
+    fprintf(file, "%d\n", (unsigned)time(NULL));
+}
+
 bool respondByServer(int clientSock, char *serverBuffer, Request* request)
 {
     int serverSock;
@@ -426,7 +471,6 @@ bool respondByServer(int clientSock, char *serverBuffer, Request* request)
         return false;
     }
     
-    //printf("trying to get %s\n", request->urlInfo.page);
     ssize_t sent_bytes;
     ssize_t received_bytes;
     
@@ -436,7 +480,9 @@ bool respondByServer(int clientSock, char *serverBuffer, Request* request)
     char cacheFileName[strlen(CACHEDIR)+HASHSTRLEN];
     strcpy(cacheFileName, CACHEDIR);
     strcat(cacheFileName, request->urlInfo.md5Hash);
-    FILE* cacheFile = fopen(cacheFileName, "a");
+    FILE* cacheFile = fopen(cacheFileName, "wb+");
+    
+    writeTimeStamp(cacheFile);
     
     while ((received_bytes = recvfrom(serverSock, serverBuffer, MAXLINE, 0, (struct sockaddr *) &server, &serverLen)) > 0) 
     {
@@ -447,10 +493,10 @@ bool respondByServer(int clientSock, char *serverBuffer, Request* request)
         bzero(serverBuffer, MAXLINE);
     }
 
-    //printf("got %s\n", request->urlInfo.page);
-
     fclose(cacheFile);
     close(serverSock);
+
+    printf("got %s by server\n", request->urlInfo.md5Hash);
     return true;
 }
 
@@ -472,7 +518,7 @@ void * thread(void * vargp)
 int open_listenfd(int port) 
 {
     int listenfd, optval=1;
-    struct sockaddr_in serveraddr;
+    struct sockaddr_in proxyaddr;
   
     /* Create a socket descriptor */
     if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
@@ -485,11 +531,11 @@ int open_listenfd(int port)
 
     /* listenfd will be an endpoint for all requests to port
        on any IP address for this host */
-    bzero((char *) &serveraddr, sizeof(serveraddr));
-    serveraddr.sin_family = AF_INET; 
-    serveraddr.sin_addr.s_addr = htonl(INADDR_ANY); 
-    serveraddr.sin_port = htons((unsigned short)port); 
-    if (bind(listenfd, (struct sockaddr*)&serveraddr, sizeof(serveraddr)) < 0)
+    bzero((char *) &proxyaddr, sizeof(proxyaddr));
+    proxyaddr.sin_family = AF_INET; 
+    proxyaddr.sin_addr.s_addr = htonl(INADDR_ANY); 
+    proxyaddr.sin_port = htons((unsigned short)port); 
+    if (bind(listenfd, (struct sockaddr*)&proxyaddr, sizeof(proxyaddr)) < 0)
         return -1;
 
     /* Make it a listening socket ready to accept connection requests */
